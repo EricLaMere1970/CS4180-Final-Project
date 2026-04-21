@@ -16,7 +16,8 @@ import numpy as np
 import json
 import os
 from copy import copy
-import game_2048 as game
+import game.game_2048 as game
+from shared.tuple_networks import NTupleNetwork
 
 Board = game.Board
 IllegalAction = game.IllegalAction
@@ -38,77 +39,6 @@ PATTERNS = [
 ]
 
 
-class NTupleNetwork:
-    """Lookup-table based function approximator. Each tuple pattern indexes into its own weight table.
-    Board value = sum of all lookups across all patterns."""
-
-    def __init__(self, tuple_patterns, max_tile_power=15):
-        self.base = max_tile_power + 1  # 16 possible cell values (0 thru 15)
-        self.patterns = self.generate_pattern_variants(tuple_patterns)
-
-        # one LUT per pattern, each with base^6 entries
-        self.luts = [np.zeros(self.base ** len(p), dtype=np.float64)
-                     for p in self.patterns]
-
-    # Rotate board index 90deg clockwise.
-    def rotate_clockwise(self, idx):
-        r, c = divmod(idx, 4)
-        return c * 4 + (3 - r)
-
-
-    # Horizontal reflection.
-    def flip(self, idx):
-        r, c = divmod(idx, 4)
-        return r * 4 + (3 - c)
-
-    # Generate all patterns from the existing patterns using 4 reflections and 2 rotations.
-    def generate_pattern_variants(self, patterns):
-        result = []
-        for pat in patterns:
-            seen = set()
-            cur = list(pat)
-            for _ in range(4):
-                t = tuple(cur)
-                if t not in seen:
-                    seen.add(t)
-                    result.append(t)
-                ref = tuple(self.flip(i) for i in cur)
-                if ref not in seen:
-                    seen.add(ref)
-                    result.append(ref)
-                cur = [self.rotate_clockwise(i) for i in cur]
-        return result
-
-    # Get LUT index from pattern
-    def idx(self, board, pattern):
-        i = 0
-        for pos in pattern:
-            i = i * self.base + board[pos]
-        return i
-
-    # Sum all LUT lookups for this board.
-    def value(self, board):
-        # NOTE : This is based on the paper referenced
-        return sum(lut[self.idx(board, p)] for p, lut in zip(self.patterns, self.luts))
-
-    # Update the board values by adding the difference = alpha * (target - estimate)
-    def update(self, board, diff):
-        for p, lut in zip(self.patterns, self.luts):
-            lut[self.idx(board, p)] += diff
-
-    # Save the
-    def save(self, path):
-        data = {f"lut_{i}": lut for i, lut in enumerate(self.luts)}
-        np.savez_compressed(path, **data)
-
-    def load(self, path):
-        data = np.load(path, allow_pickle=True)
-        for i in range(len(self.luts)):
-            k = f"lut_{i}"
-            if k in data:
-                self.luts[i] = data[k].astype(np.float64)
-
-
 class MultiStageTDAgent:
     """Two-stage TD(0) agent. Stage 0 handles the game up to the 4096 tile,
     stage 1 handles everything after. Each stage has its own NTupleNetwork.
@@ -124,7 +54,7 @@ class MultiStageTDAgent:
         self.n_stages = len(self.thresholds) + 1
         self.networks = [NTupleNetwork(self.patterns) for _ in range(self.n_stages)]
 
-    # Get the stage that this board is in (stage 0 or stage 1 for two stages)
+    # Get the stage that this board is in
     def get_stage(self, board):
         mx = max(board)
         s = 0
@@ -206,20 +136,13 @@ def save_log(save_path, log):
     np.savez_compressed(base + "_log.npz", **{k: np.array(v) for k, v in log.items()})
 
 
-def train(n_episodes, alpha, decay_rate, thresholds, save_path, resume_from=None,
-          log_every=1000, save_every=10000):
+def train(n_episodes, alpha, decay_rate, thresholds, save_path, log_every=1000, save_every=10000):
     agent = MultiStageTDAgent(alpha=alpha, stage_thresholds=thresholds)
-    if resume_from:
-        try:
-            agent.load(resume_from)
-            print(f"resumed from {resume_from}")
-        except Exception as e:
-            print(f"unable to load {resume_from}, error: {e}")
-
     scores, tiles = [], []
     best_rate = 0.0
     log = {"episodes": [], "avg_scores": [], "max_scores": [], "rate_1024": [], "rate_2048": [], "rate_4096": [], "lr": []}
 
+    # NOTE : no valid actions breaks the loop
     for ep in range(1, n_episodes + 1):
         lr = agent.updated_alpha(ep, decay_rate)
         board = Board()
@@ -245,27 +168,27 @@ def train(n_episodes, alpha, decay_rate, thresholds, save_path, resume_from=None
         if ep % log_every == 0:
             rec_s = scores[-log_every:]
             rec_t = tiles[-log_every:]
-            avg, mx = np.mean(rec_s), np.max(rec_s)
-            r1024 = sum(t >= 1024 for t in rec_t) / log_every * 100
-            r2048 = sum(t >= 2048 for t in rec_t) / log_every * 100
-            r4096 = sum(t >= 4096 for t in rec_t) / log_every * 100
+            avg_score = np.mean(rec_s)
+            max_score = np.max(rec_s)
+            r_1024 = sum(t >= 1024 for t in rec_t) / log_every * 100
+            r_2048 = sum(t >= 2048 for t in rec_t) / log_every * 100
+            r_4096 = sum(t >= 4096 for t in rec_t) / log_every * 100
 
-            print(f"ep {ep:>7d} | avg: {avg:>8.0f} | max: {mx:>8.0f} | "
-                  f"1024: {r1024:>5.1f}% | 2048: {r2048:>5.1f}% | "
-                  f"4096: {r4096:>5.1f}% | lr: {lr:.6f}")
+            print(f"ep {ep:>7d} | avg: {avg_score:>8.0f} | max: {max_score:>8.0f} | 1024: {r_1024:>5.1f}% | 2048: {r_2048:>5.1f}% | 4096: {r_4096:>5.1f}% | lr: {lr:.6f}")
 
             log["episodes"].append(ep)
-            log["avg_scores"].append(avg)
-            log["max_scores"].append(mx)
-            log["rate_1024"].append(r1024)
-            log["rate_2048"].append(r2048)
-            log["rate_4096"].append(r4096)
+            log["avg_scores"].append(avg_score)
+            log["max_scores"].append(max_score)
+            log["rate_1024"].append(r_1024)
+            log["rate_2048"].append(r_2048)
+            log["rate_4096"].append(r_4096)
             log["lr"].append(lr)
 
-            if r2048 > best_rate:
-                best_rate = r2048
+            # NOTE : Changed to save the latest best 2048 rate model npz file
+            if r_2048 >= best_rate:
+                best_rate = r_2048
                 agent.save(save_path.replace(".npz", "_best.npz"))
-                print(f"  new best: {r2048:.1f}%")
+                print(f"new best: {r_2048:.1f}%")
 
         if ep % save_every == 0:
             agent.save(save_path)
@@ -278,11 +201,4 @@ def train(n_episodes, alpha, decay_rate, thresholds, save_path, resume_from=None
 
 
 if __name__ == "__main__":
-    train(
-        n_episodes=100000,
-        alpha=0.0025,
-        decay_rate=50000,
-        thresholds=[12],
-        save_path="model_mstd.npz",
-        resume_from=None,
-    )
+    train(n_episodes=100000, alpha=0.0025, decay_rate=50000, thresholds=[12], save_path="model_mstd.npz",)
