@@ -47,9 +47,9 @@ def legal_moves_filter(board):
         b = Board(copy(board))
         try:
             b.act(a)
+            filtered_moves[a] = 1.0
         except IllegalAction:
             pass
-        filtered_moves[a] = 1.0
 
     return filtered_moves
 
